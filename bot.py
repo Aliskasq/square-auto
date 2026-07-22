@@ -430,7 +430,13 @@ async def processing_worker(app: Application):
             async with _processing_lock:
                 try:
                     result = await process_ticker(ticker, price, sector)
-                    if result:
+                    if result == "💀 ALL_MODELS_DEAD":
+                        await _notify_admin(
+                            f"💀 Все модели и все ключи мертвы!\n"
+                            f"Монета ${ticker} не обработана.\n"
+                            f"Проверь ключи и модели."
+                        )
+                    elif result:
                         await _notify_admin(f"📢 ${ticker}: {result}")
                 except Exception as e:
                     logger.error(f"Pipeline error {ticker}: {e}")

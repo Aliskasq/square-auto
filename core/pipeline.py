@@ -226,8 +226,8 @@ async def process_ticker(ticker: str, price: float, sector: str = "") -> str | N
     ai_response = await ask_ai(system_prompt, user_message, model)
 
     if not ai_response:
-        logger.error(f"AI returned empty for {symbol}")
-        return None
+        logger.error(f"AI returned empty for {symbol} — all models × all keys failed!")
+        return "💀 ALL_MODELS_DEAD"
 
     # 7. Clean AI response + prepend $TICKER
     ai_response = _clean_ai_response(ai_response)

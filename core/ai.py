@@ -1,16 +1,29 @@
-"""AI chat via OpenRouter — sequential requests with model + key rotation."""
+"""AI chat via OpenRouter — sequential requests with model + key rotation.
+
+Key memory: if key 2 worked last time, next post starts from key 2.
+Only goes back to key 1 after key 3 fails (full circle).
+"""
 import logging
 import asyncio
 import httpx
-from config import get_api_key, count_request, force_rotate_key, OPENROUTER_KEYS
+from config import count_request, OPENROUTER_KEYS
 
 logger = logging.getLogger(__name__)
+
+# Persistent state: remember which key is currently working
+_key_state = {"idx": 0}
+
+
+def _get_key(idx: int) -> str | None:
+    if not OPENROUTER_KEYS:
+        return None
+    return OPENROUTER_KEYS[idx % len(OPENROUTER_KEYS)]
 
 
 async def _try_single_request(model: str, api_key: str, system_prompt: str, user_text: str) -> tuple[str | None, bool]:
     """Try one request with specific model + key.
     
-    Returns: (response_text or None, should_rotate_key: bool)
+    Returns: (response_text or None, is_429: bool)
     """
     messages = []
     if system_prompt:
@@ -30,7 +43,7 @@ async def _try_single_request(model: str, api_key: str, system_prompt: str, user
             )
 
             if resp.status_code == 429:
-                return None, True  # rate limit — rotate key
+                return None, True
 
             if resp.status_code != 200:
                 logger.error(f"AI HTTP {resp.status_code} on {model}")
@@ -64,10 +77,12 @@ async def ask_ai(system_prompt: str, user_text: str, model: str) -> str | None:
     """Send prompt to AI with full rotation: models × keys.
     
     Flow:
-    1. Try all models with current key
-    2. If all fail — rotate to next key, try all models again
-    3. Repeat until all keys exhausted
-    4. Only return None if ALL keys × ALL models failed
+    - Start with the key that worked last time (_key_state)
+    - Try all models with that key
+    - If all fail → move to next key, try all models
+    - If that key works → remember it for next post
+    - Only go back to previous key after full circle
+    - If ALL keys × ALL models fail → return None (caller sends TG alert)
     """
     from config import get
 
@@ -75,58 +90,50 @@ async def ask_ai(system_prompt: str, user_text: str, model: str) -> str | None:
     if not models:
         models = [model]
 
-    # Find start index for model rotation
     try:
-        start_idx = models.index(model)
+        start_model_idx = models.index(model)
     except ValueError:
-        start_idx = 0
+        start_model_idx = 0
 
     total_keys = max(len(OPENROUTER_KEYS), 1)
-    keys_tried = 0
+    start_key_idx = _key_state["idx"]
 
-    while keys_tried < total_keys:
-        api_key = get_api_key()
+    for key_attempt in range(total_keys):
+        key_idx = (start_key_idx + key_attempt) % total_keys
+        api_key = _get_key(key_idx)
         if not api_key:
-            return None
+            continue
 
         key_short = api_key[-6:]
-        key_had_429 = False
 
-        # Try all models with this key
-        for i in range(len(models)):
-            idx = (start_idx + i) % len(models)
-            current_model = models[idx]
+        for model_attempt in range(len(models)):
+            m_idx = (start_model_idx + model_attempt) % len(models)
+            current_model = models[m_idx]
             short_name = current_model.split("/")[-1]
 
-            if i > 0:
-                logger.info(f"🔄 Fallback model {i+1}/{len(models)}: {short_name} (key ...{key_short})")
+            if key_attempt > 0 or model_attempt > 0:
+                logger.info(f"🔄 key ...{key_short} model {model_attempt+1}/{len(models)}: {short_name}")
 
-            response, should_rotate = await _try_single_request(
+            response, is_429 = await _try_single_request(
                 current_model, api_key, system_prompt, user_text
             )
 
             if response:
-                if i > 0:
-                    logger.info(f"✅ Fallback {short_name} responded")
+                # Success! Remember this key for next post
+                _key_state["idx"] = key_idx
+                if key_attempt > 0 or model_attempt > 0:
+                    logger.info(f"✅ key ...{key_short} / {short_name} responded")
                 return response
 
-            if should_rotate:
-                key_had_429 = True
-                logger.warning(f"🔑 Key ...{key_short} got 429 on {short_name}")
-                break  # Stop trying models with this key, rotate key
+            if is_429:
+                logger.warning(f"🔑 Key ...{key_short} got 429, moving to next key")
+                break  # Try next key
 
-            # Small delay before trying next model
             await asyncio.sleep(1)
 
-        # Rotate to next key
-        keys_tried += 1
-        if keys_tried < total_keys:
-            if force_rotate_key():
-                new_key = get_api_key()
-                logger.info(f"🔑 Rotated to key ...{new_key[-6:]} (attempt {keys_tried + 1}/{total_keys})")
-                await asyncio.sleep(3)
-            else:
-                break
+        # Small delay before trying next key
+        if key_attempt < total_keys - 1:
+            await asyncio.sleep(3)
 
-    logger.error(f"All {total_keys} keys × {len(models)} models failed!")
+    logger.error(f"💀 All {total_keys} keys × {len(models)} models failed!")
     return None
