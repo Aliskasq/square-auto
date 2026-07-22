@@ -28,7 +28,7 @@ REQUESTS_PER_KEY = 48
 SETTINGS_FILE = os.path.join(os.path.dirname(__file__), "data", "settings.json")
 
 _defaults = {
-    "models": ["google/gemma-3n-e4b-it:free"],
+    "models": [],  # up to 8 models, rotated per post, fallback on failure
     "pause_minutes": 6,
     "sleep_start": "01:00",  # MSK
     "sleep_end": "05:00",    # MSK
@@ -99,9 +99,14 @@ def force_rotate_key():
     return True
 
 
+MAX_MODELS = 8
+
+DEFAULT_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
+
+
 def get_current_model(post_number: int) -> str:
-    """Rotate models based on post number."""
-    models = _settings.get("models", ["google/gemma-3n-e4b-it:free"])
+    """Rotate models based on post number. Max 8 models."""
+    models = _settings.get("models", [])
     if not models:
-        return "google/gemma-3n-e4b-it:free"
+        return DEFAULT_MODEL
     return models[post_number % len(models)]

@@ -164,13 +164,15 @@ async def cmd_models(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if ctx.args[0].lower() == "clear":
             set_val("models", [])
             return await update.message.reply_text("🗑 Модели очищены")
-        # Add model
+        # Add model (max 8)
         model_name = " ".join(ctx.args).strip()
         if model_name not in current:
+            if len(current) >= 8:
+                return await update.message.reply_text("⚠️ Максимум 8 моделей! Используй /models clear")
             current.append(model_name)
             set_val("models", current)
         return await update.message.reply_text(
-            f"✅ Модели ({len(current)}):\n" +
+            f"✅ Модели ({len(current)}/8):\n" +
             "\n".join(f"  {i+1}. {m}" for i, m in enumerate(current))
         )
 
@@ -216,8 +218,11 @@ async def callback_model_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         current.remove(model_id)
         await query.answer(f"❌ Удалён")
     else:
+        if len(current) >= 8:
+            await query.answer(f"⚠️ Максимум 8 моделей!")
+            return
         current.append(model_id)
-        await query.answer(f"✅ Добавлен")
+        await query.answer(f"✅ Добавлен ({len(current)}/8)")
 
     set_val("models", current)
 
