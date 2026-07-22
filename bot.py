@@ -337,7 +337,14 @@ _daily_limit_alerted = {"day_key": "", "alerted": False}
 
 
 async def processing_worker(app: Application):
-    """Background worker — processes tickers sequentially with pause between posts."""
+    """Background worker — processes tickers sequentially with pause between posts.
+    
+    Logic:
+    1. Wake from sleep → filter queue (top 5 growers)
+    2. Process overflow/sleep queue first
+    3. If queue empty and hour has free slots → backfill from group 2 (top by growth)
+    4. Track pace: 5/hour, ~98/day minimum
+    """
     logger.info("🔄 Processing worker started")
 
     _was_sleeping = qm.is_sleep_time()
@@ -362,15 +369,15 @@ async def processing_worker(app: Application):
                 await asyncio.sleep(60)
                 continue
 
-            # Check queue for overflow/sleep items
+            # --- Fill processing queue ---
             if _processing_queue.empty():
+                # 1. Process overflow/sleep queue first
                 queue = qm.get_queue()
                 if queue:
                     for item in queue[:]:
                         can_post, reason = qm.can_post_now()
                         if not can_post:
                             if "daily" in reason:
-                                # Daily limit — wait 1 hour, alert once
                                 day_key = qm._current_day_key()
                                 if _daily_limit_alerted.get("day_key") != day_key:
                                     _daily_limit_alerted["day_key"] = day_key
@@ -385,28 +392,52 @@ async def processing_worker(app: Application):
                         if qm.is_recently_posted(item["ticker"]):
                             qm.remove_from_queue(item["ticker"])
                             continue
-                        await _processing_queue.put((item["ticker"], item["price"], item.get("sector", "")))
+                        await _processing_queue.put((item["ticker"], item["price"], item.get("sector", ""), "queue"))
                         qm.remove_from_queue(item["ticker"])
 
-                # If still empty, check group 2
+                # 2. If still empty — backfill from group 2
                 if _processing_queue.empty():
+                    slots = qm.hour_slots_remaining()
                     can_post, _ = qm.can_post_now()
-                    if can_post:
-                        best = await qm.get_best_group2_ticker()
-                        if best and not qm.is_recently_posted(best["ticker"]):
-                            logger.info(f"📈 Group2 best: ${best['ticker']} +{best.get('growth_pct', 0):.1f}%")
-                            await _processing_queue.put((best["ticker"], best.get("current_price", best["price"]), best.get("sector", "")))
+                    
+                    if can_post and slots > 0:
+                        # Check if we're behind pace — if yes, fill all remaining slots
+                        behind, deficit = qm.are_we_behind_pace()
+                        fill_count = slots  # Always fill remaining hour slots from group 2
+                        
+                        if behind:
+                            logger.info(f"📉 Behind pace by {deficit} posts, filling {fill_count} slots from group 2")
+                        else:
+                            logger.info(f"📋 Hour has {slots} free slots, checking group 2")
+                        
+                        top_g2 = await qm.get_top_group2_tickers(fill_count)
+                        for item in top_g2:
+                            logger.info(f"📈 Group2 fill: ${item['ticker']} +{item.get('growth_pct', 0):.1f}%")
+                            await _processing_queue.put((
+                                item["ticker"],
+                                item.get("current_price", item["price"]),
+                                item.get("sector", ""),
+                                "group2"
+                            ))
 
-            # Get next ticker
+            # --- Get next ticker ---
             try:
-                ticker, price, sector = await asyncio.wait_for(_processing_queue.get(), timeout=30)
+                result = await asyncio.wait_for(_processing_queue.get(), timeout=30)
             except asyncio.TimeoutError:
                 continue
+
+            # Unpack (support both 3-tuple and 4-tuple)
+            if len(result) == 4:
+                ticker, price, sector, source = result
+            else:
+                ticker, price, sector = result
+                source = "group1"
 
             # Check limits again
             can_post, reason = qm.can_post_now()
             if not can_post:
-                qm.add_to_queue(ticker, price, sector, f"overflow:{reason}")
+                if source != "group2":  # Don't re-queue group2 items
+                    qm.add_to_queue(ticker, price, sector, f"overflow:{reason}")
                 if "daily" in reason:
                     day_key = qm._current_day_key()
                     if _daily_limit_alerted.get("day_key") != day_key:
@@ -423,10 +454,11 @@ async def processing_worker(app: Application):
                 continue
 
             if qm.is_sleep_time():
-                qm.add_to_queue(ticker, price, sector, "sleep")
+                if source != "group2":
+                    qm.add_to_queue(ticker, price, sector, "sleep")
                 continue
 
-            # Process
+            # --- Process ---
             async with _processing_lock:
                 try:
                     result = await process_ticker(ticker, price, sector)
@@ -438,6 +470,9 @@ async def processing_worker(app: Application):
                         )
                     elif result:
                         await _notify_admin(f"📢 ${ticker}: {result}")
+                        # Remove from group 2 after successful post
+                        if source == "group2":
+                            qm.remove_group2_ticker(ticker)
                 except Exception as e:
                     logger.error(f"Pipeline error {ticker}: {e}")
 

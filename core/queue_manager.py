@@ -1,4 +1,4 @@
-"""Queue manager — handles sleep, overflow, dedup, hourly/daily limits."""
+"""Queue manager — handles sleep, overflow, dedup, hourly/daily limits, group 2 backfill."""
 import json
 import logging
 import os
@@ -16,6 +16,10 @@ DEDUP_FILE = os.path.join(DATA_DIR, "dedup.json")
 COUNTERS_FILE = os.path.join(DATA_DIR, "counters.json")
 
 MSK = timezone(timedelta(hours=3))
+
+# Active hours per day: 05:00-01:00 MSK = 20 hours (sleep 01:00-05:00 = 4h)
+ACTIVE_HOURS = 20
+TARGET_DAILY_MIN = 98
 
 
 def _ensure_dir():
@@ -39,18 +43,15 @@ def _save_json(path, data):
 # --- Dedup ---
 
 def is_recently_posted(ticker: str) -> bool:
-    """Check if ticker was posted within dedup window."""
     dedup = _load_json(DEDUP_FILE, {})
     dedup_hours = get("dedup_hours") or 4
     cutoff = time.time() - dedup_hours * 3600
-    # Cleanup old entries
     dedup = {k: v for k, v in dedup.items() if v > cutoff}
     _save_json(DEDUP_FILE, dedup)
     return ticker in dedup
 
 
 def mark_posted(ticker: str):
-    """Mark ticker as posted."""
     dedup = _load_json(DEDUP_FILE, {})
     dedup[ticker] = time.time()
     _save_json(DEDUP_FILE, dedup)
@@ -63,6 +64,7 @@ def _load_counters() -> dict:
         "hour_key": "", "hour_count": 0,
         "day_key": "", "day_count": 0,
         "total_post_number": 0,
+        "hour_history": {},  # "YYYY-MM-DD-HH": count — for pace tracking
     })
 
 
@@ -89,12 +91,10 @@ def _current_day_key() -> str:
 
 
 def can_post_now() -> tuple[bool, str]:
-    """Check if we can post right now. Returns (allowed, reason)."""
     c = _load_counters()
     hour_key = _current_hour_key()
     day_key = _current_day_key()
 
-    # Reset counters if new period
     if c.get("hour_key") != hour_key:
         c["hour_key"] = hour_key
         c["hour_count"] = 0
@@ -128,7 +128,74 @@ def increment_post_count():
     c["hour_count"] += 1
     c["day_count"] += 1
     c["total_post_number"] = c.get("total_post_number", 0) + 1
+
+    # Save hour history for pace tracking
+    hh = c.get("hour_history", {})
+    hh[hour_key] = c["hour_count"]
+    # Cleanup old (keep last 48h)
+    cutoff_dt = datetime.now(MSK) - timedelta(hours=48)
+    cutoff_key = cutoff_dt.strftime("%Y-%m-%d-%H")
+    hh = {k: v for k, v in hh.items() if k >= cutoff_key}
+    c["hour_history"] = hh
+
     _save_counters(c)
+
+
+def hour_slots_remaining() -> int:
+    c = _load_counters()
+    hour_key = _current_hour_key()
+    hc = c["hour_count"] if c.get("hour_key") == hour_key else 0
+    max_hour = get("posts_per_hour") or 5
+    return max(0, max_hour - hc)
+
+
+def day_posts_count() -> int:
+    c = _load_counters()
+    day_key = _current_day_key()
+    return c["day_count"] if c.get("day_key") == day_key else 0
+
+
+def day_slots_remaining() -> int:
+    max_day = get("posts_per_day") or 100
+    return max(0, max_day - day_posts_count())
+
+
+def are_we_behind_pace() -> tuple[bool, int]:
+    """Check if we're behind pace to reach 98 posts/day.
+    
+    Active hours: 05:00-01:00 MSK (20 hours).
+    Target: ~5 posts/hour.
+    
+    Returns: (behind: bool, deficit: int)
+    """
+    now = datetime.now(MSK)
+    
+    # Calculate hours elapsed since day start (05:00 MSK, first active hour)
+    day_start_hour = 5  # First active hour after sleep
+    
+    if now.hour >= day_start_hour:
+        hours_elapsed = now.hour - day_start_hour + 1
+    elif now.hour < 3:
+        # 00:00-02:59 MSK = still same day, hours_elapsed = 20-24h territory
+        hours_elapsed = (24 - day_start_hour) + now.hour + 1
+    else:
+        # 03:00-04:59 = sleep time, shouldn't be called but handle gracefully
+        return False, 0
+    
+    hours_elapsed = min(hours_elapsed, ACTIVE_HOURS)
+    
+    # Expected posts by now
+    posts_per_hour = get("posts_per_hour") or 5
+    expected = hours_elapsed * posts_per_hour
+    actual = day_posts_count()
+    
+    deficit = expected - actual
+    behind = deficit > 0
+    
+    if behind:
+        logger.debug(f"Pace check: {hours_elapsed}h elapsed, expected {expected}, actual {actual}, deficit {deficit}")
+    
+    return behind, max(0, deficit)
 
 
 def get_counters_info() -> str:
@@ -137,13 +204,14 @@ def get_counters_info() -> str:
     day_key = _current_day_key()
     hc = c["hour_count"] if c.get("hour_key") == hour_key else 0
     dc = c["day_count"] if c.get("day_key") == day_key else 0
-    return f"Hour: {hc}/{get('posts_per_hour')}, Day: {dc}/{get('posts_per_day')}, Total: {c.get('total_post_number', 0)}"
+    behind, deficit = are_we_behind_pace()
+    pace_str = f" ⚠️ -{deficit} behind pace" if behind else " ✅ on pace"
+    return f"Hour: {hc}/{get('posts_per_hour')}, Day: {dc}/{get('posts_per_day')}{pace_str}, Total: {c.get('total_post_number', 0)}"
 
 
 # --- Sleep ---
 
 def is_sleep_time() -> bool:
-    """Check if current time is in sleep window (MSK)."""
     now = datetime.now(MSK)
     sleep_start = get("sleep_start") or "01:00"
     sleep_end = get("sleep_end") or "05:00"
@@ -160,16 +228,14 @@ def is_sleep_time() -> bool:
 
     if start_min <= end_min:
         return start_min <= now_min < end_min
-    else:  # crosses midnight
+    else:
         return now_min >= start_min or now_min < end_min
 
 
 # --- Queue (overflow + sleep) ---
 
 def add_to_queue(ticker: str, price: float, sector: str = "", source: str = "group1"):
-    """Add ticker to queue (overflow or sleep)."""
     q = _load_json(QUEUE_FILE, [])
-    # Don't add duplicates
     if any(item["ticker"] == ticker for item in q):
         return
     q.append({
@@ -198,23 +264,18 @@ def clear_queue():
 
 
 async def filter_queue_on_wake() -> tuple[int, int, list]:
-    """On wake from sleep: check prices, drop >15% losers, keep only top 5 growers.
-    
-    Returns: (dropped_count, kept_count, kept_tickers_list)
-    """
+    """On wake: drop >15% losers, keep only top 5 growers."""
     from core.binance_api import get_current_price
     q = _load_json(QUEUE_FILE, [])
     if not q:
         return 0, 0, []
     
     drop_pct = get("drop_pct") or 15
-    
-    # 1. Check current prices, calculate growth
     candidates = []
     dropped = 0
+    
     for item in q:
         if item.get("source", "").startswith("overflow"):
-            # Overflow items — keep as-is (not sleep items)
             candidates.append(item)
             continue
         
@@ -222,7 +283,7 @@ async def filter_queue_on_wake() -> tuple[int, int, list]:
         if current and item["price"] > 0:
             change_pct = ((current - item["price"]) / item["price"]) * 100
             if change_pct < -drop_pct:
-                logger.info(f"🗑 Sleep drop {item['ticker']}: {change_pct:.1f}% from push")
+                logger.info(f"🗑 Sleep drop {item['ticker']}: {change_pct:.1f}%")
                 dropped += 1
                 continue
             item["current_price"] = current
@@ -231,18 +292,15 @@ async def filter_queue_on_wake() -> tuple[int, int, list]:
             item["growth_pct"] = 0
         candidates.append(item)
     
-    # 2. Separate overflow items from sleep items
     overflow_items = [c for c in candidates if c.get("source", "").startswith("overflow")]
     sleep_items = [c for c in candidates if not c.get("source", "").startswith("overflow")]
     
-    # 3. Sort sleep items by growth, keep only top 5
     sleep_items.sort(key=lambda x: x.get("growth_pct", 0), reverse=True)
     kept_sleep = sleep_items[:5]
     discarded = len(sleep_items) - len(kept_sleep)
     if discarded > 0:
-        logger.info(f"🗑 Discarded {discarded} sleep tickers (kept top 5 by growth)")
+        logger.info(f"🗑 Discarded {discarded} sleep tickers (kept top 5)")
     
-    # 4. Save filtered queue (overflow + top 5 sleep)
     final_queue = overflow_items + kept_sleep
     _save_json(QUEUE_FILE, final_queue)
     
@@ -251,7 +309,6 @@ async def filter_queue_on_wake() -> tuple[int, int, list]:
 
 
 async def filter_queue_by_price():
-    """Legacy wrapper — calls filter_queue_on_wake."""
     dropped, kept, _ = await filter_queue_on_wake()
     return dropped
 
@@ -259,9 +316,14 @@ async def filter_queue_by_price():
 # --- Group 2 tickers ---
 
 def add_group2_ticker(ticker: str, price: float, sector: str = ""):
-    """Log ticker from secondary group."""
+    """Log ticker from secondary group. Kept for 48 hours."""
     g2 = _load_json(GROUP2_FILE, [])
-    # Update if exists
+    
+    # Remove expired (>48h)
+    cutoff = time.time() - 48 * 3600
+    g2 = [t for t in g2 if t["timestamp"] > cutoff]
+    
+    # Update if exists, else add
     g2 = [t for t in g2 if t["ticker"] != ticker]
     g2.append({
         "ticker": ticker,
@@ -269,36 +331,55 @@ def add_group2_ticker(ticker: str, price: float, sector: str = ""):
         "sector": sector,
         "timestamp": time.time(),
     })
-    # Keep last 200
-    if len(g2) > 200:
-        g2 = g2[-200:]
+    
+    # Keep last 500
+    if len(g2) > 500:
+        g2 = g2[-500:]
     _save_json(GROUP2_FILE, g2)
 
 
-async def get_best_group2_ticker() -> dict | None:
-    """Get the best performing ticker from group 2 (most growth from push price)."""
+def remove_group2_ticker(ticker: str):
+    """Remove ticker from group 2 (after posting)."""
+    g2 = _load_json(GROUP2_FILE, [])
+    g2 = [t for t in g2 if t["ticker"] != ticker]
+    _save_json(GROUP2_FILE, g2)
+
+
+async def get_top_group2_tickers(count: int) -> list[dict]:
+    """Get top N tickers from group 2 sorted by growth from push price.
+    
+    Filters: not recently posted, not expired (48h), positive growth only.
+    Returns list of dicts with current_price and growth_pct added.
+    """
     from core.binance_api import get_current_price
     g2 = _load_json(GROUP2_FILE, [])
     if not g2:
-        return None
+        return []
 
-    # Filter out old ones (>24h)
-    cutoff = time.time() - 24 * 3600
+    # Filter expired (>48h)
+    cutoff = time.time() - 48 * 3600
     g2 = [t for t in g2 if t["timestamp"] > cutoff]
 
-    best = None
-    best_growth = -999
-
+    # Check prices and calculate growth
+    scored = []
     for item in g2:
         if is_recently_posted(item["ticker"]):
             continue
         current = await get_current_price(item["ticker"])
         if current and item["price"] > 0:
             growth = ((current - item["price"]) / item["price"]) * 100
-            if growth > best_growth and growth > 0:
-                best_growth = growth
-                best = item
-                best["current_price"] = current
-                best["growth_pct"] = growth
+            if growth > 0:  # Only growing coins
+                entry = dict(item)
+                entry["current_price"] = current
+                entry["growth_pct"] = growth
+                scored.append(entry)
 
-    return best
+    # Sort by growth descending, return top N
+    scored.sort(key=lambda x: x["growth_pct"], reverse=True)
+    return scored[:count]
+
+
+async def get_best_group2_ticker() -> dict | None:
+    """Legacy: get single best ticker."""
+    top = await get_top_group2_tickers(1)
+    return top[0] if top else None
