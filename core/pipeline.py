@@ -1,6 +1,8 @@
 """Main pipeline — fetch candles, compute indicators, send to AI, post to Square."""
 import logging
 import os
+import re
+import unicodedata
 import pandas as pd
 from core.binance_api import fetch_klines, fetch_funding_rate
 from core.indicators import calculate_binance_indicators, format_tf_summary
@@ -13,6 +15,47 @@ from config import get, get_current_model
 logger = logging.getLogger(__name__)
 
 PROMPT_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "Prompt.txt")
+
+
+def _clean_ai_response(text: str) -> str:
+    """Remove strange symbols, non-latin scripts (Chinese, Arabic, etc.), 
+    and fix common AI artifacts."""
+    if not text:
+        return text
+    
+    # Remove leading $TICKER if AI added it despite instructions
+    # e.g. "$ACE " or "$ACE\n" or "$ACE —"
+    text = re.sub(r'^\$[A-Z]{1,15}\s*[—–\-]?\s*', '', text).strip()
+    
+    # Remove non-latin, non-emoji characters (Chinese, Arabic, Cyrillic, etc.)
+    cleaned = []
+    for ch in text:
+        cat = unicodedata.category(ch)
+        # Allow: ASCII, Latin Extended, common punctuation, emojis, digits, spaces
+        cp = ord(ch)
+        if cp < 0x0250:  # Basic Latin + Latin Extended-A
+            cleaned.append(ch)
+        elif 0x2000 <= cp <= 0x27FF:  # General punctuation, symbols, dingbats
+            cleaned.append(ch)
+        elif 0x2900 <= cp <= 0x2BFF:  # Arrows, math symbols
+            cleaned.append(ch)
+        elif cat.startswith('So'):  # Symbol, other (includes emojis)
+            cleaned.append(ch)
+        elif cat.startswith('Sk'):  # Symbol, modifier
+            cleaned.append(ch)
+        elif cp >= 0x1F000:  # Emoji ranges
+            cleaned.append(ch)
+        # Skip everything else (CJK, Cyrillic, Arabic, etc.)
+    
+    text = ''.join(cleaned)
+    
+    # Fix merged words (e.g. "theFunding" -> "the Funding")
+    text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
+    
+    # Remove multiple spaces
+    text = re.sub(r' {2,}', ' ', text).strip()
+    
+    return text
 
 
 def _load_prompt() -> str:
@@ -161,12 +204,12 @@ async def process_ticker(ticker: str, price: float, sector: str = "") -> str | N
     smc_1h_text = smc_1h.get("summary", "")
     smc_15m_text = smc_15m.get("summary", "")
 
-    # 6. Build AI prompt
+    # 6. Build AI prompt (ticker without USDT, AI doesn't need to guess it)
     sector_phrase = _get_sector_phrase(sector, post_number)
     sector_context = f"\nSector: {sector}. {sector_phrase}" if sector else ""
 
     user_message = (
-        f"Ticker: ${short_name}\n"
+        f"Coin: {short_name}\n"
         f"Price: {price}\n"
         f"Funding: {funding}\n"
         f"{sector_context}\n\n"
@@ -186,20 +229,26 @@ async def process_ticker(ticker: str, price: float, sector: str = "") -> str | N
         logger.error(f"AI returned empty for {symbol}")
         return None
 
-    # 7. Build Square post
+    # 7. Clean AI response + prepend $TICKER
+    ai_response = _clean_ai_response(ai_response)
+    if not ai_response or len(ai_response) < 50:
+        logger.error(f"AI response too short after cleaning for {symbol}")
+        return None
+
+    # 8. Build Square post — $TICKER added by us, not AI
     hashtags = get("hashtags") or "#BinanceSquare #Write2Earn"
-    square_text = f"{ai_response}\n\n{hashtags}"
+    square_text = f"${short_name}\n{ai_response}\n\n{hashtags}"
 
     if len(square_text) > 2100:
         square_text = square_text[:2097] + "..."
 
-    # 8. Post to Square
+    # 9. Post to Square
     from config import SQUARE_API_KEY
     result = await post_to_square(square_text, SQUARE_API_KEY)
 
     logger.info(f"📢 {symbol}: {result}")
 
-    # 9. Update counters
+    # 10. Update counters
     qm.increment_post_count()
     qm.mark_posted(ticker)
 
