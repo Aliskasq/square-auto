@@ -197,22 +197,63 @@ def clear_queue():
     _save_json(QUEUE_FILE, [])
 
 
-async def filter_queue_by_price():
-    """Remove tickers from queue where price dropped >drop_pct% from push price."""
+async def filter_queue_on_wake() -> tuple[int, int, list]:
+    """On wake from sleep: check prices, drop >15% losers, keep only top 5 growers.
+    
+    Returns: (dropped_count, kept_count, kept_tickers_list)
+    """
     from core.binance_api import get_current_price
     q = _load_json(QUEUE_FILE, [])
+    if not q:
+        return 0, 0, []
+    
     drop_pct = get("drop_pct") or 15
-    filtered = []
+    
+    # 1. Check current prices, calculate growth
+    candidates = []
+    dropped = 0
     for item in q:
+        if item.get("source", "").startswith("overflow"):
+            # Overflow items — keep as-is (not sleep items)
+            candidates.append(item)
+            continue
+        
         current = await get_current_price(item["ticker"])
         if current and item["price"] > 0:
             change_pct = ((current - item["price"]) / item["price"]) * 100
             if change_pct < -drop_pct:
-                logger.info(f"Dropped {item['ticker']}: {change_pct:.1f}% from push")
+                logger.info(f"🗑 Sleep drop {item['ticker']}: {change_pct:.1f}% from push")
+                dropped += 1
                 continue
-        filtered.append(item)
-    _save_json(QUEUE_FILE, filtered)
-    return len(q) - len(filtered)
+            item["current_price"] = current
+            item["growth_pct"] = change_pct
+        else:
+            item["growth_pct"] = 0
+        candidates.append(item)
+    
+    # 2. Separate overflow items from sleep items
+    overflow_items = [c for c in candidates if c.get("source", "").startswith("overflow")]
+    sleep_items = [c for c in candidates if not c.get("source", "").startswith("overflow")]
+    
+    # 3. Sort sleep items by growth, keep only top 5
+    sleep_items.sort(key=lambda x: x.get("growth_pct", 0), reverse=True)
+    kept_sleep = sleep_items[:5]
+    discarded = len(sleep_items) - len(kept_sleep)
+    if discarded > 0:
+        logger.info(f"🗑 Discarded {discarded} sleep tickers (kept top 5 by growth)")
+    
+    # 4. Save filtered queue (overflow + top 5 sleep)
+    final_queue = overflow_items + kept_sleep
+    _save_json(QUEUE_FILE, final_queue)
+    
+    kept_names = [t["ticker"] for t in kept_sleep]
+    return dropped, len(kept_sleep), kept_names
+
+
+async def filter_queue_by_price():
+    """Legacy wrapper — calls filter_queue_on_wake."""
+    dropped, kept, _ = await filter_queue_on_wake()
+    return dropped
 
 
 # --- Group 2 tickers ---

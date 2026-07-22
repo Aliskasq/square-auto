@@ -317,25 +317,65 @@ async def handle_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _processing_queue.put((ticker, price, sector))
 
 
+async def _notify_admin(text: str):
+    """Send notification to admin via TG."""
+    try:
+        from telegram import Bot
+        bot = Bot(TG_BOT_TOKEN)
+        await bot.send_message(ADMIN_ID, text)
+    except Exception as e:
+        logger.error(f"Failed to notify admin: {e}")
+
+
+# Track daily limit alert to avoid spam
+_daily_limit_alerted = {"day_key": "", "alerted": False}
+
+
 async def processing_worker(app: Application):
     """Background worker — processes tickers sequentially with pause between posts."""
     logger.info("🔄 Processing worker started")
 
+    _was_sleeping = qm.is_sleep_time()
+
     while True:
         try:
-            # Check queue for overflow/sleep items first
+            # Detect wake-up from sleep
+            is_sleeping = qm.is_sleep_time()
+            if _was_sleeping and not is_sleeping:
+                logger.info("☀️ Waking up from sleep! Filtering queue...")
+                dropped, kept, kept_names = await qm.filter_queue_on_wake()
+                logger.info(f"☀️ Wake filter: dropped={dropped}, kept top {kept}: {kept_names}")
+                if kept_names:
+                    await _notify_admin(
+                        f"☀️ Проснулся!\n"
+                        f"🗑 Убрал {dropped} монет (упали >15%)\n"
+                        f"✅ Топ {kept} по росту: {', '.join('$'+t for t in kept_names)}"
+                    )
+            _was_sleeping = is_sleeping
+
+            if is_sleeping:
+                await asyncio.sleep(60)
+                continue
+
+            # Check queue for overflow/sleep items
             if _processing_queue.empty():
                 queue = qm.get_queue()
-                if queue and not qm.is_sleep_time():
-                    # Filter by price drop on wake
-                    dropped = await qm.filter_queue_by_price()
-                    if dropped > 0:
-                        logger.info(f"🗑 Dropped {dropped} tickers (price fell >15%)")
-
-                    queue = qm.get_queue()
+                if queue:
                     for item in queue[:]:
                         can_post, reason = qm.can_post_now()
                         if not can_post:
+                            if "daily" in reason:
+                                # Daily limit — wait 1 hour, alert once
+                                day_key = qm._current_day_key()
+                                if _daily_limit_alerted.get("day_key") != day_key:
+                                    _daily_limit_alerted["day_key"] = day_key
+                                    _daily_limit_alerted["alerted"] = True
+                                    await _notify_admin(
+                                        f"🚫 Суточный лимит исчерпан ({get('posts_per_day')})!\n"
+                                        f"⏳ Попробую снова через час."
+                                    )
+                                logger.info("Daily limit hit, sleeping 1 hour")
+                                await asyncio.sleep(3600)
                             break
                         if qm.is_recently_posted(item["ticker"]):
                             qm.remove_from_queue(item["ticker"])
@@ -346,7 +386,7 @@ async def processing_worker(app: Application):
                 # If still empty, check group 2
                 if _processing_queue.empty():
                     can_post, _ = qm.can_post_now()
-                    if can_post and not qm.is_sleep_time():
+                    if can_post:
                         best = await qm.get_best_group2_ticker()
                         if best and not qm.is_recently_posted(best["ticker"]):
                             logger.info(f"📈 Group2 best: ${best['ticker']} +{best.get('growth_pct', 0):.1f}%")
@@ -362,6 +402,16 @@ async def processing_worker(app: Application):
             can_post, reason = qm.can_post_now()
             if not can_post:
                 qm.add_to_queue(ticker, price, sector, f"overflow:{reason}")
+                if "daily" in reason:
+                    day_key = qm._current_day_key()
+                    if _daily_limit_alerted.get("day_key") != day_key:
+                        _daily_limit_alerted["day_key"] = day_key
+                        _daily_limit_alerted["alerted"] = True
+                        await _notify_admin(
+                            f"🚫 Суточный лимит исчерпан ({get('posts_per_day')})!\n"
+                            f"⏳ Попробую снова через час."
+                        )
+                    await asyncio.sleep(3600)
                 continue
 
             if qm.is_recently_posted(ticker):
@@ -376,13 +426,7 @@ async def processing_worker(app: Application):
                 try:
                     result = await process_ticker(ticker, price, sector)
                     if result:
-                        # Notify admin
-                        try:
-                            from telegram import Bot
-                            bot = Bot(TG_BOT_TOKEN)
-                            await bot.send_message(ADMIN_ID, f"📢 ${ticker}: {result}")
-                        except Exception:
-                            pass
+                        await _notify_admin(f"📢 ${ticker}: {result}")
                 except Exception as e:
                     logger.error(f"Pipeline error {ticker}: {e}")
 
