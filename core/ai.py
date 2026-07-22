@@ -1,85 +1,73 @@
-"""AI chat via OpenRouter — sequential requests with model rotation."""
+"""AI chat via OpenRouter — sequential requests with model + key rotation."""
 import logging
+import asyncio
 import httpx
 from config import get_api_key, count_request, force_rotate_key, OPENROUTER_KEYS
 
 logger = logging.getLogger(__name__)
 
 
-async def _try_model(model: str, system_prompt: str, user_text: str) -> str | None:
-    """Try a single model with key rotation on 429. Returns response or None."""
-    tried = 0
-    total_keys = len(OPENROUTER_KEYS)
+async def _try_single_request(model: str, api_key: str, system_prompt: str, user_text: str) -> tuple[str | None, bool]:
+    """Try one request with specific model + key.
+    
+    Returns: (response_text or None, should_rotate_key: bool)
+    """
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": user_text})
 
-    while tried < max(total_keys, 1):
-        api_key = get_api_key()
-        if not api_key:
-            return None
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={"model": model, "messages": messages},
+                timeout=120,
+            )
 
-        messages = []
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": user_text})
+            if resp.status_code == 429:
+                return None, True  # rate limit — rotate key
 
-        try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(
-                    "https://openrouter.ai/api/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={"model": model, "messages": messages},
-                    timeout=120,
-                )
+            if resp.status_code != 200:
+                logger.error(f"AI HTTP {resp.status_code} on {model}")
+                return None, False
 
-                if resp.status_code == 429:
-                    tried += 1
-                    if force_rotate_key():
-                        logger.info(f"Key 429 on {model}, rotated key")
-                        continue
-                    return None
+            data = resp.json()
+            if "error" in data:
+                err = data["error"]
+                if err.get("code") == 429 or "429" in str(err):
+                    return None, True
+                logger.error(f"AI error on {model}: {err}")
+                return None, False
 
-                if resp.status_code != 200:
-                    logger.error(f"AI HTTP {resp.status_code} on {model}")
-                    return None
+            choices = data.get("choices") or [{}]
+            content = (choices[0].get("message") or {}).get("content", "")
+            if content and len(content.strip()) > 20:
+                count_request()
+                return content.strip(), False
+            logger.warning(f"AI empty/short response from {model}")
+            return None, False
 
-                data = resp.json()
-                if "error" in data:
-                    err = data["error"]
-                    if err.get("code") == 429 or "429" in str(err):
-                        tried += 1
-                        if force_rotate_key():
-                            continue
-                        return None
-                    logger.error(f"AI error on {model}: {err}")
-                    return None
-
-                choices = data.get("choices") or [{}]
-                content = (choices[0].get("message") or {}).get("content", "")
-                if content and len(content.strip()) > 20:
-                    count_request()
-                    return content.strip()
-                logger.warning(f"AI empty/short response from {model}")
-                return None
-
-        except httpx.TimeoutException:
-            logger.error(f"AI timeout on {model}")
-            return None
-        except Exception as e:
-            logger.error(f"AI exception on {model}: {e}")
-            return None
-
-    return None
+    except httpx.TimeoutException:
+        logger.error(f"AI timeout on {model}")
+        return None, False
+    except Exception as e:
+        logger.error(f"AI exception on {model}: {e}")
+        return None, False
 
 
 async def ask_ai(system_prompt: str, user_text: str, model: str) -> str | None:
-    """Send prompt to AI. If the given model fails, try next models in rotation.
+    """Send prompt to AI with full rotation: models × keys.
     
-    Args:
-        model: The primary model to try first.
-    
-    Returns response text or None if all models failed.
+    Flow:
+    1. Try all models with current key
+    2. If all fail — rotate to next key, try all models again
+    3. Repeat until all keys exhausted
+    4. Only return None if ALL keys × ALL models failed
     """
     from config import get
 
@@ -87,28 +75,58 @@ async def ask_ai(system_prompt: str, user_text: str, model: str) -> str | None:
     if not models:
         models = [model]
 
-    # Find the index of the current model
+    # Find start index for model rotation
     try:
         start_idx = models.index(model)
     except ValueError:
         start_idx = 0
 
-    # Try all models starting from the designated one
-    for i in range(len(models)):
-        idx = (start_idx + i) % len(models)
-        current_model = models[idx]
-        short = current_model.split("/")[-1]
+    total_keys = max(len(OPENROUTER_KEYS), 1)
+    keys_tried = 0
 
-        if i > 0:
-            logger.info(f"🔄 Fallback to model {i+1}/{len(models)}: {short}")
+    while keys_tried < total_keys:
+        api_key = get_api_key()
+        if not api_key:
+            return None
 
-        response = await _try_model(current_model, system_prompt, user_text)
-        if response:
+        key_short = api_key[-6:]
+        key_had_429 = False
+
+        # Try all models with this key
+        for i in range(len(models)):
+            idx = (start_idx + i) % len(models)
+            current_model = models[idx]
+            short_name = current_model.split("/")[-1]
+
             if i > 0:
-                logger.info(f"✅ Fallback model {short} responded")
-            return response
+                logger.info(f"🔄 Fallback model {i+1}/{len(models)}: {short_name} (key ...{key_short})")
 
-        logger.warning(f"❌ Model {short} failed, trying next...")
+            response, should_rotate = await _try_single_request(
+                current_model, api_key, system_prompt, user_text
+            )
 
-    logger.error(f"All {len(models)} models failed!")
+            if response:
+                if i > 0:
+                    logger.info(f"✅ Fallback {short_name} responded")
+                return response
+
+            if should_rotate:
+                key_had_429 = True
+                logger.warning(f"🔑 Key ...{key_short} got 429 on {short_name}")
+                break  # Stop trying models with this key, rotate key
+
+            # Small delay before trying next model
+            await asyncio.sleep(1)
+
+        # Rotate to next key
+        keys_tried += 1
+        if keys_tried < total_keys:
+            if force_rotate_key():
+                new_key = get_api_key()
+                logger.info(f"🔑 Rotated to key ...{new_key[-6:]} (attempt {keys_tried + 1}/{total_keys})")
+                await asyncio.sleep(3)
+            else:
+                break
+
+    logger.error(f"All {total_keys} keys × {len(models)} models failed!")
     return None
