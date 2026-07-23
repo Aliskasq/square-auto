@@ -1,12 +1,23 @@
-"""Binance Futures API — klines + current price + futures symbol check."""
+"""Binance Futures API — klines + current price + futures symbol check.
+
+Uses API key if provided (separate rate limit per account).
+"""
 import logging
 import asyncio
+import os
 import time
 import httpx
 
 logger = logging.getLogger(__name__)
 
-LAST_WEIGHT_WARNING = 0
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
+
+
+def _headers() -> dict:
+    """Return headers with API key if available."""
+    if BINANCE_API_KEY:
+        return {"X-MBX-APIKEY": BINANCE_API_KEY}
+    return {}
 
 
 async def fetch_klines(symbol: str, interval: str, limit: int = 1500) -> list | None:
@@ -15,7 +26,7 @@ async def fetch_klines(symbol: str, interval: str, limit: int = 1500) -> list | 
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     try:
         async with httpx.AsyncClient() as client:
-            resp = await client.get(url, params=params, timeout=15)
+            resp = await client.get(url, params=params, headers=_headers(), timeout=15)
             if resp.status_code == 200:
                 raw = resp.json()
                 if not raw:
@@ -49,7 +60,7 @@ async def fetch_current_price(symbol: str) -> float | None:
     url = "https://fapi.binance.com/fapi/v1/ticker/price"
     try:
         async with httpx.AsyncClient() as client:
-            resp = await client.get(url, params={"symbol": symbol}, timeout=10)
+            resp = await client.get(url, params={"symbol": symbol}, headers=_headers(), timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
                 return float(data.get("price", 0))
@@ -73,7 +84,7 @@ async def fetch_price_mexc(symbol: str) -> float | None:
 
 
 async def get_current_price(symbol: str) -> float | None:
-    """Get price, trying MEXC first then Binance."""
+    """Get price, trying MEXC first then Binance (save Binance weight)."""
     price = await fetch_price_mexc(symbol)
     if price and price > 0:
         return price
@@ -85,7 +96,7 @@ async def is_futures_symbol(symbol: str) -> bool:
     url = "https://fapi.binance.com/fapi/v1/ticker/price"
     try:
         async with httpx.AsyncClient() as client:
-            resp = await client.get(url, params={"symbol": symbol}, timeout=10)
+            resp = await client.get(url, params={"symbol": symbol}, headers=_headers(), timeout=10)
             return resp.status_code == 200
     except Exception:
         return False
@@ -96,7 +107,7 @@ async def fetch_funding_rate(symbol: str) -> str:
     url = "https://fapi.binance.com/fapi/v1/premiumIndex"
     try:
         async with httpx.AsyncClient() as client:
-            resp = await client.get(url, params={"symbol": symbol}, timeout=5)
+            resp = await client.get(url, params={"symbol": symbol}, headers=_headers(), timeout=5)
             if resp.status_code == 200:
                 data = resp.json()
                 rate = float(data.get("lastFundingRate", 0)) * 100
