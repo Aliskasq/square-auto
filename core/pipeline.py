@@ -287,14 +287,33 @@ async def process_ticker(ticker: str, price: float, sector: str = "") -> str | N
     if len(square_text) > 2100:
         square_text = square_text[:2097] + "..."
 
-    # Step 5: Post to Square
-    from config import SQUARE_API_KEY
-    result = await post_to_square(square_text, SQUARE_API_KEY)
+    # Step 5: Generate chart image
+    chart_path = None
+    try:
+        from core.chart_generator import generate_chart_for_symbol
+        chart_path = await generate_chart_for_symbol(symbol, f"/tmp/{symbol}_chart.png")
+        if chart_path:
+            logger.info(f"📊 Chart generated for ${short_name}")
+        else:
+            logger.warning(f"⚠️ Chart generation failed for ${short_name}, posting text-only")
+    except Exception as e:
+        logger.warning(f"⚠️ Chart error for ${short_name}: {e}")
 
-    # Step 6: Update counters + clear cache
+    # Step 6: Post to Square (with chart if available)
+    from config import SQUARE_API_KEY
+    result = await post_to_square(square_text, SQUARE_API_KEY, image_path=chart_path)
+
+    # Step 7: Update counters + clear cache + cleanup chart
     qm.increment_post_count()
     qm.mark_posted(ticker)
     clear_cache(symbol)
+
+    # Cleanup temp chart file
+    if chart_path:
+        try:
+            os.remove(chart_path)
+        except Exception:
+            pass
 
     logger.info(f"✅ ${short_name} опубликован | модель: {model_short} | {result}")
 
