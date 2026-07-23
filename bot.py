@@ -348,21 +348,42 @@ async def processing_worker(app: Application):
     logger.info("🔄 Processing worker started")
 
     _was_sleeping = qm.is_sleep_time()
+    _posts_group1 = 0
+    _posts_group2 = 0
+    _sleep_report_sent = False
 
     while True:
         try:
-            # Detect wake-up from sleep
+            # Detect transition to sleep → send daily report
             is_sleeping = qm.is_sleep_time()
+            if not _was_sleeping and is_sleeping and not _sleep_report_sent:
+                total = _posts_group1 + _posts_group2
+                counters_info = qm.get_counters_info()
+                await _notify_admin(
+                    f"😴 Ушёл спать\n\n"
+                    f"📊 Итог за день:\n"
+                    f"  Группа 1: {_posts_group1} постов\n"
+                    f"  Группа 2: {_posts_group2} постов\n"
+                    f"  Всего: {total}\n"
+                    f"  {counters_info}\n\n"
+                    f"  В очереди сна: {len(qm.get_queue())} монет"
+                )
+                _sleep_report_sent = True
+
+            # Detect wake-up from sleep
             if _was_sleeping and not is_sleeping:
                 logger.info("☀️ Waking up from sleep! Filtering queue...")
                 dropped, kept, kept_names = await qm.filter_queue_on_wake()
                 logger.info(f"☀️ Wake filter: dropped={dropped}, kept top {kept}: {kept_names}")
-                if kept_names:
-                    await _notify_admin(
-                        f"☀️ Проснулся!\n"
-                        f"🗑 Убрал {dropped} монет (упали >15%)\n"
-                        f"✅ Топ {kept} по росту: {', '.join('$'+t for t in kept_names)}"
-                    )
+                await _notify_admin(
+                    f"☀️ Проснулся!\n"
+                    f"🗑 Убрал {dropped} монет (упали >15%)\n"
+                    f"✅ Топ {kept} по росту: {', '.join('$'+t for t in kept_names) if kept_names else 'нет'}"
+                )
+                # Reset daily counters
+                _posts_group1 = 0
+                _posts_group2 = 0
+                _sleep_report_sent = False
             _was_sleeping = is_sleeping
 
             if is_sleeping:
@@ -464,15 +485,16 @@ async def processing_worker(app: Application):
                     result = await process_ticker(ticker, price, sector)
                     if result == "💀 ALL_MODELS_DEAD":
                         await _notify_admin(
-                            f"💀 Все модели и все ключи мертвы!\n"
+                            f"🚨 Все модели и все ключи мертвы!\n"
                             f"Монета ${ticker} не обработана.\n"
                             f"Проверь ключи и модели."
                         )
                     elif result:
-                        await _notify_admin(f"📢 ${ticker}: {result}")
-                        # Remove from group 2 after successful post
                         if source == "group2":
+                            _posts_group2 += 1
                             qm.remove_group2_ticker(ticker)
+                        else:
+                            _posts_group1 += 1
                 except Exception as e:
                     logger.error(f"Pipeline error {ticker}: {e}")
 

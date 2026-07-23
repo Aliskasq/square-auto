@@ -10,6 +10,12 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+# Suppress noisy telegram/httpx logs
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext").setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
 
@@ -26,6 +32,16 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         logger.debug("Conflict (normal at startup), ignoring")
         return
     logger.error(f"Unhandled error: {context.error}", exc_info=context.error)
+    # Send critical errors to admin via TG
+    try:
+        from config import ADMIN_ID
+        err_text = str(context.error)[:500]
+        await context.bot.send_message(
+            ADMIN_ID,
+            f"🚨 Критическая ошибка:\n{err_text}"
+        )
+    except Exception:
+        pass
 
 
 def main():
