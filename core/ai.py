@@ -39,7 +39,7 @@ async def _try_single_request(model: str, api_key: str, system_prompt: str, user
                     "Content-Type": "application/json",
                 },
                 json={"model": model, "messages": messages},
-                timeout=120,
+                timeout=240,
             )
 
             if resp.status_code == 429:
