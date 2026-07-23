@@ -172,15 +172,28 @@ async def process_ticker(ticker: str, price: float, sector: str = "") -> str | N
 
     logger.info(f"📊 Processing {symbol}...")
 
-    # 1. Fetch candles (1500 for SMC, reuse for indicators)
-    raw_1h = await fetch_klines(symbol, "1h", 1500)
-    if not raw_1h:
-        logger.error(f"Failed to fetch 1H klines for {symbol}")
-        return None
-
+    # 1. Fetch candles — single request, 15M, aggregate to 1H
     raw_15m = await fetch_klines(symbol, "15m", 1500)
     if not raw_15m:
         logger.error(f"Failed to fetch 15M klines for {symbol}")
+        return None
+
+    # Aggregate 15M → 1H (4 candles per 1H)
+    raw_1h = []
+    for i in range(0, len(raw_15m) - 3, 4):
+        chunk = raw_15m[i:i+4]
+        raw_1h.append({
+            "open_time": chunk[0]["open_time"],
+            "open": chunk[0]["open"],
+            "high": max(c["high"] for c in chunk),
+            "low": min(c["low"] for c in chunk),
+            "close": chunk[-1]["close"],
+            "volume": sum(c["volume"] for c in chunk),
+            "taker_buy_volume": sum(c["taker_buy_volume"] for c in chunk),
+        })
+
+    if len(raw_1h) < 100:
+        logger.error(f"Not enough 1H candles after aggregation for {symbol}: {len(raw_1h)}")
         return None
 
     # 2. Calculate indicators
