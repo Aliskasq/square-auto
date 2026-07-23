@@ -319,7 +319,7 @@ async def handle_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     # Process immediately (sequential)
-    await _processing_queue.put((ticker, price, sector))
+    await _processing_queue.put((ticker, price, sector, "group1"))
 
 
 async def _notify_admin(text: str):

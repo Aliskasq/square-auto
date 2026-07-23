@@ -266,18 +266,18 @@ async def process_ticker(ticker: str, price: float, sector: str = "") -> str | N
     model = get_current_model(post_number)
 
     # Step 2: Ask AI (uses cached prompt text, retries models+keys internally)
-    logger.info(f"🤖 Sending to AI (model: {model})...")
+    model_short = model.split("/")[-1]
+    logger.info(f"🤖 ${short_name} → AI модель: {model_short}")
     ai_response = await ask_ai(data["system_prompt"], data["user_message"], model)
 
     if not ai_response:
-        logger.error(f"AI returned empty for {symbol} — all models × all keys failed!")
-        # DON'T clear cache — maybe next attempt will work
+        logger.error(f"❌ ${short_name} — все модели × все ключи не ответили!")
         return "💀 ALL_MODELS_DEAD"
 
     # Step 3: Clean AI response + prepend $TICKER
     ai_response = _clean_ai_response(ai_response)
     if not ai_response or len(ai_response) < 50:
-        logger.error(f"AI response too short after cleaning for {symbol}")
+        logger.error(f"❌ ${short_name} — ответ AI слишком короткий после очистки")
         return None
 
     # Step 4: Build Square post
@@ -291,11 +291,11 @@ async def process_ticker(ticker: str, price: float, sector: str = "") -> str | N
     from config import SQUARE_API_KEY
     result = await post_to_square(square_text, SQUARE_API_KEY)
 
-    logger.info(f"📢 {symbol}: {result}")
-
     # Step 6: Update counters + clear cache
     qm.increment_post_count()
     qm.mark_posted(ticker)
     clear_cache(symbol)
 
-    return result
+    logger.info(f"✅ ${short_name} опубликован | модель: {model_short} | {result}")
+
+    return f"✅ модель: {model_short}"
