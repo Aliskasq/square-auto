@@ -55,10 +55,16 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sleeping = "💤 СПИТ" if qm.is_sleep_time() else "✅ Активен"
     counters = qm.get_counters_info()
     queue = qm.get_queue()
+    day_posts = qm.day_posts_count()
+    behind, deficit = qm.are_we_behind_pace()
+    pace = f"⚠️ отстаём на {deficit}" if behind else "✅ в темпе"
 
     await update.message.reply_text(
         f"📊 Статус: {sleeping}\n\n"
-        f"🤖 Модели ({len(models)}):\n" +
+        f"📝 Постов сегодня: {day_posts}/{s.get('posts_per_day', 100)}\n"
+        f"  Группа 1: {_posts_group1} | Группа 2: {_posts_group2}\n"
+        f"  Темп: {pace}\n\n"
+        f"🤖 Модели ({len(models)}/8):\n" +
         "\n".join(f"  {i+1}. {m}" for i, m in enumerate(models)) + "\n\n"
         f"💤 Сон: {sleep_str}\n"
         f"⏸ Пауза: {s.get('pause_minutes', 6)} мин\n"
@@ -422,24 +428,19 @@ async def processing_worker(app: Application):
                     can_post, _ = qm.can_post_now()
                     
                     if can_post and slots > 0:
-                        # Check if we're behind pace — if yes, fill all remaining slots
-                        behind, deficit = qm.are_we_behind_pace()
-                        fill_count = slots  # Always fill remaining hour slots from group 2
-                        
-                        if behind:
-                            logger.info(f"📉 Behind pace by {deficit} posts, filling {fill_count} slots from group 2")
-                        else:
-                            logger.info(f"📋 Hour has {slots} free slots, checking group 2")
-                        
-                        top_g2 = await qm.get_top_group2_tickers(fill_count)
-                        for item in top_g2:
-                            logger.info(f"📈 Group2 fill: ${item['ticker']} +{item.get('growth_pct', 0):.1f}%")
-                            await _processing_queue.put((
-                                item["ticker"],
-                                item.get("current_price", item["price"]),
-                                item.get("sector", ""),
-                                "group2"
-                            ))
+                        top_g2 = await qm.get_top_group2_tickers(slots)
+                        if top_g2:
+                            behind, deficit = qm.are_we_behind_pace()
+                            if behind:
+                                logger.info(f"📉 Behind pace by {deficit}, filling {len(top_g2)} slots from group 2")
+                            for item in top_g2:
+                                logger.info(f"📈 Group2 fill: ${item['ticker']} +{item.get('growth_pct', 0):.1f}%")
+                                await _processing_queue.put((
+                                    item["ticker"],
+                                    item.get("current_price", item["price"]),
+                                    item.get("sector", ""),
+                                    "group2"
+                                ))
 
             # --- Get next ticker ---
             try:
