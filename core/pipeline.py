@@ -161,39 +161,39 @@ def _get_sector_phrase(sector: str, post_number: int) -> str:
     return f"{sector} sector coin showing momentum"
 
 
-async def process_ticker(ticker: str, price: float, sector: str = "") -> str | None:
-    """Full pipeline: fetch → indicators → AI → post. Returns result or None."""
+# Cache for prepared AI prompts — don't reload candles on model retry
+_data_cache: dict[str, dict] = {}
+
+
+async def prepare_data(ticker: str, price: float, sector: str = "") -> dict | None:
+    """Step 1: Fetch candles (2 requests), calculate indicators, build AI prompt.
+    
+    Cached by ticker — if model fails, we reuse this data.
+    Returns dict with system_prompt, user_message, short_name, post_number.
+    """
     symbol = ticker.upper()
     if not symbol.endswith("USDT"):
         symbol += "USDT"
 
+    # Check cache first
+    if symbol in _data_cache:
+        logger.info(f"📋 Using cached data for {symbol}")
+        return _data_cache[symbol]
+
     short_name = symbol.replace("USDT", "")
     post_number = qm.get_post_number()
 
-    logger.info(f"📊 Processing {symbol}...")
+    logger.info(f"📊 Loading data for {symbol} (2 API calls)...")
 
-    # 1. Fetch candles — single request, 15M, aggregate to 1H
+    # 1. Fetch candles — 2 requests: 1H + 15M (1500 each)
+    raw_1h = await fetch_klines(symbol, "1h", 1500)
+    if not raw_1h:
+        logger.error(f"Failed to fetch 1H klines for {symbol}")
+        return None
+
     raw_15m = await fetch_klines(symbol, "15m", 1500)
     if not raw_15m:
         logger.error(f"Failed to fetch 15M klines for {symbol}")
-        return None
-
-    # Aggregate 15M → 1H (4 candles per 1H)
-    raw_1h = []
-    for i in range(0, len(raw_15m) - 3, 4):
-        chunk = raw_15m[i:i+4]
-        raw_1h.append({
-            "open_time": chunk[0]["open_time"],
-            "open": chunk[0]["open"],
-            "high": max(c["high"] for c in chunk),
-            "low": min(c["low"] for c in chunk),
-            "close": chunk[-1]["close"],
-            "volume": sum(c["volume"] for c in chunk),
-            "taker_buy_volume": sum(c["taker_buy_volume"] for c in chunk),
-        })
-
-    if len(raw_1h) < 100:
-        logger.error(f"Not enough 1H candles after aggregation for {symbol}: {len(raw_1h)}")
         return None
 
     # 2. Calculate indicators
@@ -210,14 +210,13 @@ async def process_ticker(ticker: str, price: float, sector: str = "") -> str | N
     # 4. Funding rate
     funding = await fetch_funding_rate(symbol)
 
-    # 5. Format indicator text
+    # 5. Format text
     tf_1h_text = format_tf_summary(indic_1h, "1H")
     tf_15m_text = format_tf_summary(indic_15m, "15m")
-
     smc_1h_text = smc_1h.get("summary", "")
     smc_15m_text = smc_15m.get("summary", "")
 
-    # 6. Build AI prompt (ticker without USDT, AI doesn't need to guess it)
+    # 6. Build AI prompt
     sector_phrase = _get_sector_phrase(sector, post_number)
     sector_context = f"\nSector: {sector}. {sector_phrase}" if sector else ""
 
@@ -233,36 +232,70 @@ async def process_ticker(ticker: str, price: float, sector: str = "") -> str | N
     )
 
     system_prompt = _load_prompt()
+
+    # Cache it
+    data = {
+        "system_prompt": system_prompt,
+        "user_message": user_message,
+        "short_name": short_name,
+        "symbol": symbol,
+        "post_number": post_number,
+    }
+    _data_cache[symbol] = data
+    logger.info(f"💾 Cached data for {symbol}")
+
+    return data
+
+
+def clear_cache(symbol: str):
+    """Remove cached data after successful post."""
+    _data_cache.pop(symbol, None)
+
+
+async def process_ticker(ticker: str, price: float, sector: str = "") -> str | None:
+    """Full pipeline: prepare data (cached) → AI → post."""
+
+    # Step 1: Prepare data (loads candles only if not cached)
+    data = await prepare_data(ticker, price, sector)
+    if not data:
+        return None
+
+    symbol = data["symbol"]
+    short_name = data["short_name"]
+    post_number = data["post_number"]
     model = get_current_model(post_number)
 
+    # Step 2: Ask AI (uses cached prompt text, retries models+keys internally)
     logger.info(f"🤖 Sending to AI (model: {model})...")
-    ai_response = await ask_ai(system_prompt, user_message, model)
+    ai_response = await ask_ai(data["system_prompt"], data["user_message"], model)
 
     if not ai_response:
         logger.error(f"AI returned empty for {symbol} — all models × all keys failed!")
+        # DON'T clear cache — maybe next attempt will work
         return "💀 ALL_MODELS_DEAD"
 
-    # 7. Clean AI response + prepend $TICKER
+    # Step 3: Clean AI response + prepend $TICKER
     ai_response = _clean_ai_response(ai_response)
     if not ai_response or len(ai_response) < 50:
         logger.error(f"AI response too short after cleaning for {symbol}")
         return None
 
-    # 8. Build Square post — $TICKER added by us, not AI
+    # Step 4: Build Square post
     hashtags = get("hashtags") or "#BinanceSquare #Write2Earn"
     square_text = f"${short_name}\n{ai_response}\n\n{hashtags}"
 
     if len(square_text) > 2100:
         square_text = square_text[:2097] + "..."
 
-    # 9. Post to Square
+    # Step 5: Post to Square
     from config import SQUARE_API_KEY
     result = await post_to_square(square_text, SQUARE_API_KEY)
 
     logger.info(f"📢 {symbol}: {result}")
 
-    # 10. Update counters
+    # Step 6: Update counters + clear cache
     qm.increment_post_count()
     qm.mark_posted(ticker)
+    clear_cache(symbol)
 
     return result
